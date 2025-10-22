@@ -10,6 +10,7 @@ from PyQt6 import QtCore, QtWidgets
 
 import yarppg
 from yarppg.ui.qt6 import camera, utils
+from yarppg.reliability import SignalReliabilityEstimator
 
 @dataclasses.dataclass
 class SimpleQt6WindowSettings(yarppg.UiSettings):
@@ -73,6 +74,8 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         self.hr_plot.setLabel("bottom", "Seconds")
         
         self.hr_line = self.hr_plot.plot(pen=pyqtgraph.mkPen("m", width=2))
+
+        self.reliability = SignalReliabilityEstimator(fs=30.0)
 
         # --- Fond coloré statique (zones BPM) ---
         for (ymin, ymax, color) in [
@@ -168,24 +171,15 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         self.history.append((result.value, rgb.r, rgb.g, rgb.b))
         data = np.asarray(self.history)
 
-        self.plots[0].setXRange(0, len(data))  # type: ignore
+        self.plots[0].setXRange(0, len(data))
         for i in range(4):
             self.lines[i].setData(np.arange(len(data)), data[:, i])
-            self.plots[i].setYRange(*utils.get_autorange(data[:, i]))  # type: ignore
+            self.plots[i].setYRange(*utils.get_autorange(data[:, i]))
 
-        # --- Évaluer la qualité du signal ---
-        quality = self._estimate_quality(data[:, 0])  # colonne 0 = signal filtré
-        self._update_quality_label(quality)
+        # --- Fiabilité combinée ---
+        q = self.reliability.combine(data[:, 0], np.asarray(self.hr_history))
+        self._update_quality_label(q)
 
-    def _estimate_quality(self, signal: np.ndarray, fs: float = 30.0) -> float:
-        """Estimate signal quality based on spectral energy in the heart-rate band."""
-        if len(signal) < 60:
-            return np.nan
-        f, pxx = scipy.signal.welch(signal, fs=fs, nperseg=min(256, len(signal)))
-        band_mask = (f >= 0.7) & (f <= 1.8)
-        band_power = np.trapz(pxx[band_mask], f[band_mask])
-        total_power = np.trapz(pxx, f)
-        return band_power / total_power if total_power > 0 else np.nan
 
     def _update_quality_label(self, q: float):
         """Update the quality indicator text and color."""
