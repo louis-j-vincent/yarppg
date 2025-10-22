@@ -11,7 +11,6 @@ from PyQt6 import QtCore, QtWidgets
 import yarppg
 from yarppg.ui.qt6 import camera, utils
 
-
 @dataclasses.dataclass
 class SimpleQt6WindowSettings(yarppg.UiSettings):
     """Settings for the simple Qt6 window."""
@@ -48,6 +47,7 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         self._init_ui()
         self.tracker = yarppg.FpsTracker()
         self.new_image.connect(self.update_image)
+        
 
     def _init_ui(self) -> None:
         child = QtWidgets.QWidget()
@@ -94,6 +94,13 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         font.setBold(True)
         self.quality_label.setFont(font)
 
+        self.hrv_label = QtWidgets.QLabel("HRV: --")
+        font = self.hrv_label.font()
+        font.setPointSize(10)
+        self.hrv_label.setFont(font)
+
+        layout = self.centralWidget().layout()
+        layout.addWidget(self.hrv_label, 3, 1, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
         # Ajout au layout principal, en dessous du HR plot
         layout = self.centralWidget().layout()
         layout.addWidget(self.quality_label, 2, 1, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
@@ -101,7 +108,6 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         # --- Right side: main + RGB plots ---
         grid = self._make_plots()
         layout.addWidget(grid, 0, 1)
-
 
         self.fps_label = QtWidgets.QLabel("FPS:")
         layout.addWidget(
@@ -198,6 +204,12 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         self.quality_label.setText(f"Spectral Energy Ratio (SER): {q:.2f} - Quality of Signal: {label}")
         self.quality_label.setStyleSheet(f"color: {color}; font-weight: bold;")
 
+    def _compute_hrv(self, hr_values: np.ndarray) -> float:
+        """Compute heart rate variability (SDNN in seconds) from HR history."""
+        if len(hr_values) < 5:
+            return np.nan
+        rr_intervals = 60.0 / hr_values  # convert BPM → RR intervals
+        return np.std(rr_intervals)      # SDNN
 
     def _handle_hrvalue(self, value: float) -> None:
         """Update user interface with the new HR value."""
@@ -226,6 +238,16 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
                     margin = 0.1 * (ymax - ymin + 1e-6)
                     self.hr_plot.setYRange(ymin - margin, ymax + margin)
                 self.hr_line.setData(x, y_smooth)
+
+            # --- compute HRV ---
+            if len(self.hr_history) > window_size:
+                y = np.asarray(self.hr_history, dtype=float)
+                hrv_val = self._compute_hrv(y)
+                if np.isfinite(hrv_val):
+                    self.hrv_label.setText(f"HRV: {hrv_val*1000:.0f} ms")  # conversion en ms
+                else:
+                    self.hrv_label.setText("HRV: --")
+
 
     def _update_fps(self):
         self.tracker.tick()
