@@ -43,6 +43,7 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         self.roi_alpha = roi_alpha
 
         self.history = deque(maxlen=150)
+        self.hr_history = deque(maxlen=1500)  # ~50s at 30 FPS 
         self.setWindowTitle("yet another rPPG")
         self._init_ui()
         self.tracker = yarppg.FpsTracker()
@@ -55,13 +56,52 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         self.setCentralWidget(child)
 
         graph = pyqtgraph.GraphicsLayoutWidget()
-        layout.addWidget(graph, 0, 0)
+
+        # --- Left side: camera + HR plot stacked vertically ---
+        left_panel = pyqtgraph.GraphicsLayoutWidget()
+        layout.addWidget(left_panel, 0, 0)
+
+        # Camera view
         self.img_item = pyqtgraph.ImageItem(axisOrder="row-major")
-        vb = graph.addViewBox(col=0, row=0, invertX=True, invertY=True, lockAspect=True)  # type: ignore
+        vb = left_panel.addViewBox(row=0, col=0, invertX=True, invertY=True, lockAspect=True)
         vb.addItem(self.img_item)
 
+        # HR history plot (independent x-axis)
+        self.hr_plot = left_panel.addPlot(row=1, col=0)
+        self.hr_plot.setTitle("HR History (BPM)")
+        self.hr_plot.setLabel("left", "BPM")
+        self.hr_plot.setLabel("bottom", "Seconds")
+        
+        self.hr_line = self.hr_plot.plot(pen=pyqtgraph.mkPen("m", width=2))
+
+        # --- Fond coloré statique (zones BPM) ---
+        for (ymin, ymax, color) in [
+            (0, 60, (150, 200, 255, 80)),   # bleu clair : repos
+            (60, 90, (180, 255, 180, 80)),  # vert clair : normal
+            (90, 150, (255, 160, 160, 80)), # rouge clair : élevé
+        ]:
+            region = pyqtgraph.LinearRegionItem(values=(ymin, ymax), orientation='horizontal')
+            region.setBrush(pyqtgraph.mkBrush(color))
+            region.setZValue(-10)  # derrière la courbe
+            region.setMovable(False)
+            self.hr_plot.addItem(region)
+
+        # --- Indicateur de qualité du signal ---
+        self.quality_label = QtWidgets.QLabel("Quality: --")
+        self.quality_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+        font = self.quality_label.font()
+        font.setPointSize(10)
+        font.setBold(True)
+        self.quality_label.setFont(font)
+
+        # Ajout au layout principal, en dessous du HR plot
+        layout = self.centralWidget().layout()
+        layout.addWidget(self.quality_label, 2, 1, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        # --- Right side: main + RGB plots ---
         grid = self._make_plots()
         layout.addWidget(grid, 0, 1)
+
 
         self.fps_label = QtWidgets.QLabel("FPS:")
         layout.addWidget(
@@ -86,6 +126,7 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         main_plot.hideAxis("bottom")
         main_plot.hideAxis("left")
         self.rgb_plot.hideAxis("left")
+
         self.plots = [main_plot]
 
         self.lines = [main_plot.plot(pen=pyqtgraph.mkPen("k", width=3))]
@@ -126,11 +167,65 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
             self.lines[i].setData(np.arange(len(data)), data[:, i])
             self.plots[i].setYRange(*utils.get_autorange(data[:, i]))  # type: ignore
 
+        # --- Évaluer la qualité du signal ---
+        quality = self._estimate_quality(data[:, 0])  # colonne 0 = signal filtré
+        self._update_quality_label(quality)
+
+    def _estimate_quality(self, signal: np.ndarray, fs: float = 30.0) -> float:
+        """Estimate signal quality based on spectral energy in the heart-rate band."""
+        if len(signal) < 60:
+            return np.nan
+        f, pxx = scipy.signal.welch(signal, fs=fs, nperseg=min(256, len(signal)))
+        band_mask = (f >= 0.7) & (f <= 1.8)
+        band_power = np.trapz(pxx[band_mask], f[band_mask])
+        total_power = np.trapz(pxx, f)
+        return band_power / total_power if total_power > 0 else np.nan
+
+    def _update_quality_label(self, q: float):
+        """Update the quality indicator text and color."""
+        if not np.isfinite(q):
+            self.quality_label.setText("Quality of Signal: --")
+            self.quality_label.setStyleSheet("color: gray;")
+            return
+
+        if q > 0.5:
+            color, label = "green", "Good"
+        elif q > 0.3:
+            color, label = "orange", "Medium"
+        else:
+            color, label = "red", "Poor"
+
+        self.quality_label.setText(f"Spectral Energy Ratio (SER): {q:.2f} - Quality of Signal: {label}")
+        self.quality_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+
     def _handle_hrvalue(self, value: float) -> None:
         """Update user interface with the new HR value."""
-        if np.isfinite(value):
+        if np.isfinite(value) and value > 0:
             hr_bpm = self.tracker.fps * 60 / value
             self.hr_label.setText(f"HR: {hr_bpm:.1f}")
+
+            # --- push to history ---
+            self.hr_history.append(hr_bpm)
+            y = np.asarray(self.hr_history, dtype=float)
+
+            # --- smoothing ---
+            window_size = 200
+            y_smooth = self._smooth(y, window_size=window_size)
+
+            # --- x-axis in seconds ---
+            dt = 1.0 / max(1e-6, self.tracker.fps)
+            x = np.arange(len(y_smooth)) * dt
+
+            if len(y_smooth) > window_size : # plot after a 100 points in order to avoid initial jitter
+
+                # --- update plot ---
+                self.hr_plot.setXRange(0, x[-1] if len(x) > 0 else 1)
+                if len(y_smooth) > 1:
+                    ymin, ymax = np.nanmin(y_smooth), np.nanmax(y_smooth)
+                    margin = 0.1 * (ymax - ymin + 1e-6)
+                    self.hr_plot.setYRange(ymin - margin, ymax + margin)
+                self.hr_line.setData(x, y_smooth)
 
     def _update_fps(self):
         self.tracker.tick()
@@ -147,6 +242,13 @@ class SimpleQt6Window(QtWidgets.QMainWindow):
         """Handle key presses. Closes the window on Q."""
         if e.key() == ord("Q"):
             self.close()
+
+    @staticmethod
+    def _smooth(y: np.ndarray, window_size: int = 5) -> np.ndarray:
+        if len(y) < window_size:
+            return y
+        kernel = np.ones(window_size) / window_size
+        return np.convolve(y, kernel, mode="valid")
 
 
 def launch_window(rppg: yarppg.Rppg, config: SimpleQt6WindowSettings) -> int:
