@@ -56,7 +56,8 @@ class DigitalFilter:
 
     def reset(self, xi: float = 0):
         """Reset filter state to initial value."""
-        self.zi = scipy.signal.lfiltic(self.b, self.a, [xi], xi)
+        xi = np.atleast_1d(xi)
+        self.zi = scipy.signal.lfiltic(self.b, self.a, xi, xi)
 
 
 def filtercoeffs_from_config(cfg: FilterConfig):
