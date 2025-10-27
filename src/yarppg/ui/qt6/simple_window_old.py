@@ -1,0 +1,404 @@
+"""Provides a PyQt window for displaying rPPG processing in real-time."""
+
+import dataclasses
+from collections import deque
+
+import cv2
+import numpy as np
+import pyqtgraph
+import scipy.signal
+from PyQt6 import QtCore, QtWidgets
+import time
+
+import yarppg
+from yarppg.ui.qt6 import camera, utils
+from yarppg.reliability import SignalReliabilityEstimator
+
+@dataclasses.dataclass
+class SimpleQt6WindowSettings(yarppg.UiSettings):
+    blursize: int | None = None
+    roi_alpha: float = 0.0
+    video: int | str = 0
+    frame_delay: float = float("nan")
+    use_reliability: bool = False  # <— Nouveau flag
+
+
+class SimpleQt6Window(QtWidgets.QMainWindow):
+    """A simple window displaying the webcam feed and processed signals."""
+
+    new_image = QtCore.pyqtSignal(np.ndarray)
+
+    def __init__(
+        self,
+        parent: QtWidgets.QWidget | None = None,
+        blursize: int | None = None,
+        roi_alpha: float = 0,
+        use_reliability: bool = False,   # <— Nouveau paramètre
+    ):
+        super().__init__(parent=parent)
+
+        pyqtgraph.setConfigOptions(
+            imageAxisOrder="row-major", antialias=True, foreground="k", background="w"
+        )
+
+        self.blursize = blursize
+        self.roi_alpha = roi_alpha
+        self.use_reliability = use_reliability
+
+        self.reliability = None
+        self._cached_rel = None
+        self._rel_thr_good = 0.5
+        self.hr_good_line = None
+        self.hr_reliable_plot = None
+        self.hr_reliable_line = None
+        self.quality_label = None
+        self._face_detected = False
+
+        self.history = deque(maxlen=150)
+        self.hr_history = deque(maxlen=1500)
+        self.setWindowTitle("yet another rPPG")
+
+        self._init_ui()
+        self.tracker = yarppg.FpsTracker()
+        self.new_image.connect(self.update_image)
+
+        # Charger le module reliability seulement si nécessaire
+        if self.use_reliability:
+            self.reliability = SignalReliabilityEstimator(fs=30.0)
+        
+
+    def _init_ui(self) -> None:
+        child = QtWidgets.QWidget()
+        layout = QtWidgets.QGridLayout()
+        child.setLayout(layout)
+        self.setCentralWidget(child)
+
+        # --- Left side: camera + HR plot stacked vertically ---
+        left_panel = pyqtgraph.GraphicsLayoutWidget()
+        layout.addWidget(left_panel, 0, 0)
+
+        # Camera view
+        self.img_item = pyqtgraph.ImageItem(axisOrder="row-major")
+        vb = left_panel.addViewBox(row=0, col=0, invertX=True, invertY=True, lockAspect=True)
+        vb.addItem(self.img_item)
+
+        # HR history plot (independent x-axis)
+        self.hr_plot = left_panel.addPlot(row=1, col=0)
+        self.hr_plot.setTitle("HR History (BPM)")
+        self.hr_plot.setLabel("left", "BPM")
+        self.hr_plot.setLabel("bottom", "Seconds")
+        
+        self.hr_line = self.hr_plot.plot(pen=pyqtgraph.mkPen("m", width=2))
+
+        if self.use_reliability:
+            good_pen = pyqtgraph.mkPen(color=(0, 160, 0, 180), width=3)
+            self.hr_good_line = self.hr_plot.plot(pen=good_pen)
+            self.quality_label = QtWidgets.QLabel("Quality: --")
+            self.quality_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight)
+            font = self.quality_label.font()
+            font.setPointSize(10)
+            font.setBold(True)
+            self.quality_label.setFont(font)
+            layout.addWidget(self.quality_label, 2, 1, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+            self.hr_reliable_plot = left_panel.addPlot(row=2, col=0)
+            self.hr_reliable_plot.setTitle("Reliable HR History (BPM)")
+            self.hr_reliable_plot.setLabel("left", "BPM")
+            self.hr_reliable_plot.setLabel("bottom", "Seconds")
+            reliable_pen = pyqtgraph.mkPen("g", width=2)
+            self.hr_reliable_line = self.hr_reliable_plot.plot(pen=reliable_pen)
+
+        self.hrv_label = QtWidgets.QLabel("HRV: --")
+        font = self.hrv_label.font()
+        font.setPointSize(10)
+        self.hrv_label.setFont(font)
+
+        layout = self.centralWidget().layout()
+        layout.addWidget(self.hrv_label, 3, 1, alignment=QtCore.Qt.AlignmentFlag.AlignHCenter)
+
+        # --- Right side: main + RGB plots ---
+        grid = self._make_plots()
+        layout.addWidget(grid, 0, 1)
+
+        self.fps_label = QtWidgets.QLabel("FPS:")
+        layout.addWidget(
+            self.fps_label, 1, 0, alignment=QtCore.Qt.AlignmentFlag.AlignBottom
+        )
+        self.hr_label = QtWidgets.QLabel("HR:")
+        font = self.hr_label.font()
+        font.setPointSize(24)
+        self.hr_label.setFont(font)
+        layout.addWidget(
+            self.hr_label, 1, 1, alignment=QtCore.Qt.AlignmentFlag.AlignCenter
+        )
+
+    def _make_plots(self) -> pyqtgraph.GraphicsLayoutWidget:
+        # We create a 2-row layout with linked x-axes.
+        # The first plot shows the signal obtained through the processor.
+        # The second plot shows average R, G and B channels in the ROI.
+        grid = pyqtgraph.GraphicsLayoutWidget()
+        main_plot: pyqtgraph.PlotItem = grid.addPlot(row=0, col=0)  # type: ignore
+        self.rgb_plot: pyqtgraph.PlotItem = grid.addPlot(row=1, col=0)  # type: ignore
+        self.rgb_plot.setXLink(main_plot.vb)  # type: ignore[attr-defined]
+        main_plot.hideAxis("bottom")
+        main_plot.hideAxis("left")
+        self.rgb_plot.hideAxis("left")
+
+        self.plots = [main_plot]
+
+        self.lines = [main_plot.plot(pen=pyqtgraph.mkPen("k", width=3))]
+        for c in "rgb":
+            pen = pyqtgraph.mkPen(c, width=1.5)
+            line, plot = utils.add_multiaxis_plot(self.rgb_plot, pen=pen)
+            self.plots.append(plot)
+            self.lines.append(line)
+
+        for plot in self.plots:
+            plot.disableAutoRange()  # type: ignore
+
+        return grid
+
+    def update_image(self, frame: np.ndarray) -> None:
+        """Update image plot item with new frame."""
+        self.img_item.setImage(frame)
+
+    def _handle_roi(
+        self, frame: np.ndarray, roi: yarppg.RegionOfInterest
+    ) -> np.ndarray:
+        mask = roi.mask
+        if mask.ndim == 3:
+            mask = mask[:, :, 0]
+        roi_mask = mask.astype(bool)
+        self._face_detected = bool(roi.face_rect is not None and np.any(roi_mask))
+
+        if not self._face_detected:
+            empty = np.zeros_like(frame)
+            cv2.putText(
+                empty,
+                "NO FACE DETECTED",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            return empty
+
+        base_frame = frame.copy()
+
+        if self.blursize is not None and roi.face_rect is not None:
+            yarppg.pixelate(base_frame, roi.face_rect, size=self.blursize)
+
+        mask_expanded = roi_mask[:, :, None]
+        base_frame = np.where(mask_expanded, base_frame, 0)
+
+        frame_float = base_frame.astype(np.float32)
+        r = frame_float[:, :, 0]
+        g = frame_float[:, :, 1]
+        b = frame_float[:, :, 2]
+        eps = 1e-6
+        ratio = np.divide(r, g + eps) + np.divide(r, b + eps)
+        ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
+
+        mono = np.zeros_like(base_frame, dtype=np.uint8)
+
+        valid = roi_mask & np.isfinite(ratio)
+        if np.any(valid):
+            roi_vals = ratio[valid]
+            roi_min = float(np.min(roi_vals))
+            roi_range = float(np.ptp(roi_vals))
+            if roi_range < 1e-6:
+                roi_range = 1.0
+            normalized = (roi_vals - roi_min) / roi_range
+            mono[:, :, 0][valid] = np.clip(normalized * 255.0, 0, 255).astype(np.uint8)
+
+        return mono
+
+    def _handle_signals(self, result: yarppg.RppgResult) -> None:
+        rgb = result.roi_mean
+        self.history.append((result.value, rgb.r, rgb.g, rgb.b))
+        data = np.asarray(self.history)
+
+        self.plots[0].setXRange(0, len(data))
+        for i in range(4):
+            self.lines[i].setData(np.arange(len(data)), data[:, i])
+            self.plots[i].setYRange(*utils.get_autorange(data[:, i]))
+
+        # --- Optional reliability ---
+        if self.use_reliability and self.reliability is not None:
+            q = self.reliability.combine(data[:, 0], np.asarray(self.hr_history))
+            self._update_quality_label(q)
+
+
+    def _update_quality_label(self, q: float):
+        """Update the quality indicator text and color."""
+        if not np.isfinite(q):
+            self.quality_label.setText("Quality of Signal: --")
+            self.quality_label.setStyleSheet("color: gray;")
+            return
+
+        if q > 0.5:
+            color, label = "green", "Good"
+        elif q > 0.3:
+            color, label = "orange", "Medium"
+        else:
+            color, label = "red", "Poor"
+
+        self.quality_label.setText(f"Spectral Energy Ratio (SER): {q:.2f} - Quality of Signal: {label}")
+        self.quality_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+
+    def _compute_hrv(self, hr_values: np.ndarray) -> float:
+        """Compute heart rate variability (SDNN in seconds) from HR history."""
+        if len(hr_values) < 5:
+            return np.nan
+        rr_intervals = 60.0 / hr_values  # convert BPM → RR intervals
+        return np.std(rr_intervals)      # SDNN
+
+    def _handle_hrvalue(self, value: float) -> None:
+        t0 = time.perf_counter()
+
+        if np.isfinite(value) and value > 0:
+            hr_bpm = self.tracker.fps * 60 / value
+            self.hr_label.setText(f"HR: {hr_bpm:.1f}")
+
+            # history → smooth → time axis
+            self.hr_history.append(hr_bpm)
+            y = np.asarray(self.hr_history, dtype=float)
+            window_size = 20
+
+            if len(y) > window_size:
+                y_smooth = self._smooth(y, window_size=window_size)
+                dt = 1.0 / max(1e-6, self.tracker.fps)
+                x = np.arange(len(y_smooth)) * dt
+
+                # autoscale
+                ymin, ymax = np.nanmin(y_smooth), np.nanmax(y_smooth)
+                margin = 0.1 * (ymax - ymin + 1e-6)
+                self.hr_plot.setYRange(ymin - margin, ymax + margin)
+                self.hr_plot.setXRange(0, x[-1])
+
+                # draw base HR every frame
+                self.hr_line.setData(x, y_smooth)
+
+                # frame counter (incrémente avant le modulo)
+                self.frame_count = getattr(self, "frame_count", 0) + 1
+
+                if self.use_reliability and self.reliability is not None:
+                    if self._cached_rel is None or (self.frame_count % 15 == 0):
+                        sig = np.asarray(self.history)[:, 0] if len(self.history) else np.array([])
+                        self._cached_rel = self.reliability.reliability_series(sig, y_smooth)
+
+                    rel = self._cached_rel
+                    if rel is None or len(rel) == 0:
+                        rel = np.full(len(y_smooth), np.nan)
+                    else:
+                        len_rel = len(rel)
+                        len_y = len(y_smooth)
+                        if len_rel < len_y:
+                            pad_val = rel[-1] if len_rel > 0 else np.nan
+                            rel = np.concatenate([np.copy(rel), np.full(len_y - len_rel, pad_val)])
+                        else:
+                            rel = rel[-len_y:]
+
+                    good_mask = np.isfinite(rel) & (rel > self._rel_thr_good)
+                    if self.hr_good_line is not None:
+                        y_good_line = np.where(good_mask, y_smooth, np.nan)
+                        self.hr_good_line.setData(x, y_good_line)
+
+                    if self.hr_reliable_line is not None and self.hr_reliable_plot is not None:
+                        reliable_values = y_smooth[good_mask]
+                        if reliable_values.size:
+                            dt_rel = (x[1] - x[0]) if len(x) > 1 else dt
+                            times = np.arange(reliable_values.size, dtype=float) * dt_rel
+                            self.hr_reliable_line.setData(times, reliable_values)
+                            x_max = max(float(times[-1]), 1.0)
+                            self.hr_reliable_plot.setXRange(0, x_max)
+                            ymin_good = float(np.nanmin(reliable_values))
+                            ymax_good = float(np.nanmax(reliable_values))
+                            margin_good = 0.1 * (ymax_good - ymin_good + 1e-6)
+                            self.hr_reliable_plot.setYRange(
+                                ymin_good - margin_good, ymax_good + margin_good
+                            )
+                        else:
+                            self.hr_reliable_line.setData([], [])
+                            self.hr_reliable_plot.setXRange(0, 1)
+
+                # HRV
+                hrv_val = self._compute_hrv(y)
+                self.hrv_label.setText(f"HRV: {hrv_val*1000:.0f} ms" if np.isfinite(hrv_val) else "HRV: --")
+
+        # print("handle_hrvalue:", (time.perf_counter() - t0)*1000, "ms")
+
+
+
+    def _update_fps(self):
+        self.tracker.tick()
+        self.fps_label.setText(f"FPS: {self.tracker.fps:.1f}")
+
+    def _handle_no_face(self) -> None:
+        """Reset primary indicators when no face is visible."""
+        self.hr_label.setText("HR: --")
+        self.hrv_label.setText("HRV: --")
+        if self.use_reliability and self.quality_label is not None:
+            self.quality_label.setText("Quality of Signal: --")
+            self.quality_label.setStyleSheet("color: gray; font-weight: bold;")
+        if self.hr_good_line is not None:
+            self.hr_good_line.setData([], [])
+        if self.hr_reliable_line is not None:
+            self.hr_reliable_line.setData([], [])
+        if self.hr_reliable_plot is not None:
+            self.hr_reliable_plot.setXRange(0, 1)
+        self._cached_rel = None
+
+    def on_result(self, result: yarppg.RppgResult, frame: np.ndarray) -> None:
+        """Update user interface with the new rPPG results."""
+        self._update_fps()
+        display_frame = self._handle_roi(frame, result.roi)
+        self.new_image.emit(display_frame)
+        if not self._face_detected:
+            self._handle_no_face()
+            return
+        self._handle_signals(result)
+        self._handle_hrvalue(result.hr)
+
+    def keyPressEvent(self, e):  # noqa: N802
+        """Handle key presses. Closes the window on Q."""
+        if e.key() == ord("Q"):
+            self.close()
+
+    @staticmethod
+    def _smooth(y: np.ndarray, window_size: int = 5) -> np.ndarray:
+        if len(y) < window_size:
+            return y
+        kernel = np.ones(window_size) / window_size
+        return np.convolve(y, kernel, mode="valid")
+
+
+def launch_window(rppg: yarppg.Rppg, config: SimpleQt6WindowSettings) -> int:
+    app = QtWidgets.QApplication([])
+    win = SimpleQt6Window(
+        blursize=config.blursize,
+        roi_alpha=config.roi_alpha,
+        use_reliability=config.use_reliability,
+    )
+
+    cam = camera.Camera(config.video, delay_frames=config.frame_delay)
+    cam.frame_received.connect(
+        lambda frame: win.on_result(rppg.process_frame(frame), frame)
+    )
+    cam.start()
+
+    win.show()
+    ret = app.exec()
+    cam.stop()
+    return ret
+
+
+if __name__ == "__main__":
+    b, a = scipy.signal.iirfilter(2, [0.7, 1.8], fs=30, btype="band")
+    livefilter = yarppg.DigitalFilter(b, a)
+    processor = yarppg.FilteredProcessor(yarppg.Processor(), livefilter)
+
+    rppg = yarppg.Rppg(processor=processor)
+    launch_window(rppg, yarppg.settings.get_config(["ui=qt6_simple"]).ui)
